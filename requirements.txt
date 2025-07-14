@@ -1,0 +1,22 @@
+# Core dependencies
+numpy==2.2.6
+opencv-python==4.12.0.88
+onnxruntime==1.22.1
+
+# GUI
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.17
+PyQt5_sip==12.17.0
+
+# Serial communication for Essae scale
+pyserial==3.5
+
+# Model conversion (for RKNN deployment)
+# Note: Install rknn-toolkit2 separately from Rockchip repository
+# pip install rknn-toolkit2==1.5.0+1fa95b5c -f https://pypi.org/simple/
+# rknnlite is included with rknn-toolkit2 installation
+
+# Development dependencies (optional)
+# pytest==7.4.0
+# black==23.7.0
+# flake8==6.1.0
