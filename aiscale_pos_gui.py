@@ -59,6 +59,51 @@ class CameraThread(QThread):
         super().__init__()
         self.active = True
         self.camera = None
+        self.mock_images = []
+        self.mock_index = 0
+        self.load_mock_images()
+        
+    def load_mock_images(self):
+        """Load mock produce images for testing"""
+        import glob
+        # Look for test images
+        image_patterns = [
+            "test_images/*.jpg",
+            "test_images/*.png",
+            "*.jpg",
+            "*.png"
+        ]
+        
+        for pattern in image_patterns:
+            for img_path in glob.glob(pattern):
+                if 'test_gradient' not in img_path and 'test_original' not in img_path:
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        # Resize to camera resolution
+                        img = cv2.resize(img, (1920, 1080))
+                        self.mock_images.append({
+                            'full': img,
+                            'name': os.path.basename(img_path)
+                        })
+                        print(f"Loaded mock image: {os.path.basename(img_path)}")
+        
+        if not self.mock_images:
+            print("No mock images found - using colored patterns")
+            # Create some colored rectangles as fallback
+            colors = [
+                ([255, 0, 0], "Red/Apple"),
+                ([0, 255, 255], "Yellow/Banana"),
+                ([0, 128, 255], "Orange"),
+                ([128, 0, 128], "Purple/Grapes"),
+                ([0, 255, 0], "Green/Mango")
+            ]
+            for color, name in colors:
+                img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+                img[:] = color
+                self.mock_images.append({
+                    'full': img,
+                    'name': name
+                })
         
     def run(self):
         # Try to open camera (0 for default)
@@ -87,17 +132,37 @@ class CameraThread(QThread):
                     # Store full resolution frame for inference
                     self.full_frame = frame
             else:
-                # Mock mode: generate test pattern
-                frame = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
-                cv2.putText(frame, "CAMERA MOCK MODE", (350, 270), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
-                # Draw grid pattern
-                for i in range(0, PREVIEW_WIDTH, 100):
-                    cv2.line(frame, (i, 0), (i, PREVIEW_HEIGHT), (128, 128, 128), 1)
-                for i in range(0, PREVIEW_HEIGHT, 100):
-                    cv2.line(frame, (0, i), (PREVIEW_WIDTH, i), (128, 128, 128), 1)
-                self.frameReady.emit(frame)
-                self.full_frame = frame
+                # Mock mode: use test images or colored patterns
+                if self.mock_images:
+                    # Cycle through mock images
+                    mock_data = self.mock_images[self.mock_index]
+                    self.full_frame = mock_data['full']
+                    
+                    # Resize for display
+                    display_frame = cv2.resize(self.full_frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT), 
+                                             interpolation=cv2.INTER_LINEAR)
+                    
+                    # Add label
+                    cv2.putText(display_frame, f"MOCK: {mock_data['name']}", (20, 40), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    
+                    self.frameReady.emit(display_frame)
+                    
+                    # Change image every 3 seconds
+                    if hasattr(self, '_mock_counter'):
+                        self._mock_counter += 1
+                        if self._mock_counter > 90:  # 30 FPS * 3 seconds
+                            self._mock_counter = 0
+                            self.mock_index = (self.mock_index + 1) % len(self.mock_images)
+                    else:
+                        self._mock_counter = 0
+                else:
+                    # Fallback grid pattern
+                    frame = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(frame, "NO CAMERA - NO TEST IMAGES", (250, 270), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+                    self.frameReady.emit(frame)
+                    self.full_frame = frame
             
             self.msleep(33)  # ~30 FPS
             
@@ -173,32 +238,40 @@ class InferenceThread(QThread):
                 print(f"❌ Model loading error: {e}")
                 print("Falling back to mock mode")
                 self.model_loaded = True  # Enable mock mode
+                self.inference_session = None  # Ensure it's None for mock mode
         
     def process_frame(self, frame):
         """Add frame to processing queue with proper preprocessing"""
-        # Crop center square from frame for inference
+        # Match the validation transform pipeline from training:
+        # 1. Resize to 256 (maintaining aspect ratio with padding if needed)
+        # 2. CenterCrop to 224
+        # 3. Convert to RGB
+        # 4. Normalize
+        
         h, w = frame.shape[:2]
         
-        # Calculate center crop (square) - matching validation preprocessing
-        size = min(h, w)
-        y_start = (h - size) // 2
-        x_start = (w - size) // 2
+        # Step 1: Resize to 256 maintaining aspect ratio
+        # This matches transforms.Resize(256) which resizes the smaller edge to 256
+        if h < w:
+            new_h = 256
+            new_w = int(w * (256 / h))
+        else:
+            new_w = 256
+            new_h = int(h * (256 / w))
         
-        # Crop center square
-        cropped = frame[y_start:y_start+size, x_start:x_start+size]
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         
-        # Resize to 256 first (matching validation transform)
-        resized_256 = cv2.resize(cropped, (256, 256), interpolation=cv2.INTER_LINEAR)
+        # Step 2: Center crop to 224x224
+        h_resized, w_resized = resized.shape[:2]
+        y_start = (h_resized - 224) // 2
+        x_start = (w_resized - 224) // 2
+        model_input = resized[y_start:y_start+224, x_start:x_start+224]
         
-        # Center crop to 224 (matching validation)
-        crop_start = (256 - 224) // 2
-        model_input = resized_256[crop_start:crop_start+224, crop_start:crop_start+224]
-        
-        # Convert BGR to RGB (OpenCV uses BGR, model expects RGB)
+        # Step 3: Convert BGR to RGB (OpenCV uses BGR, model expects RGB)
         model_input_rgb = cv2.cvtColor(model_input, cv2.COLOR_BGR2RGB)
         
-        # Normalize (matching your training normalization)
-        # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        # Step 4: Convert to float and normalize
+        # This matches the training normalization
         model_input_float = model_input_rgb.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -439,8 +512,17 @@ class AIScalePOS(QMainWindow):
         self.current_product = None
         self.current_confidence = 0.0
         self.manual_mode = False  # Flag to prevent inference after manual selection
+        self._last_frame = None  # Initialize frame storage
+        self._debug_counter = 0
         self.init_ui()
         self.init_threads()
+        
+        # Add test mode for development
+        self.test_timer = QTimer()
+        self.test_timer.timeout.connect(self.simulate_weight)
+        if '--test' in sys.argv:
+            print("[INFO] Running in test mode with simulated weight")
+            self.test_timer.start(2000)  # Update weight every 2 seconds
         
     def init_ui(self):
         """Initialize the user interface"""
@@ -721,6 +803,12 @@ class AIScalePOS(QMainWindow):
         
     def update_camera(self, frame):
         """Update camera display"""
+        # Store the full resolution frame from camera thread
+        if hasattr(self.camera_thread, 'full_frame'):
+            self._last_frame = self.camera_thread.full_frame
+        else:
+            self._last_frame = frame
+            
         # Frame is already resized for display
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
@@ -785,11 +873,12 @@ class AIScalePOS(QMainWindow):
         pixmap = QPixmap.fromImage(qt_image)
         self.camera_label.setPixmap(pixmap)
         
-        # Store frame for inference
-        self._last_frame = frame
-        
     def update_inference(self, result):
         """Update UI with inference results"""
+        # Don't update if in manual mode (unless this is from manual selection)
+        if self.manual_mode and result.get('confidence', 0) < 1.0:
+            return
+            
         self.current_product = result['class']
         self.current_confidence = result['confidence']
         
@@ -820,6 +909,18 @@ class AIScalePOS(QMainWindow):
         self.weight_label.setText(f"{weight:.3f} kg")
         self.update_total()
         
+    def simulate_weight(self):
+        """Simulate weight for testing"""
+        import random
+        if self.current_weight < 0.05:
+            # Simulate placing item
+            self.current_weight = random.uniform(0.5, 2.0)
+        else:
+            # Vary weight slightly
+            self.current_weight += random.uniform(-0.05, 0.05)
+            self.current_weight = max(0.0, self.current_weight)
+        self.update_weight(self.current_weight)
+        
     def update_total(self):
         """Calculate and update total price"""
         if self.current_product:
@@ -829,8 +930,19 @@ class AIScalePOS(QMainWindow):
             
     def trigger_inference(self):
         """Trigger inference when weight is stable"""
+        # Debug logging
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 0
+            
+        if self._debug_counter % 20 == 0:  # Log every 10 seconds (500ms * 20)
+            print(f"[DEBUG] Weight: {self.current_weight:.3f}kg, Manual: {self.manual_mode}, Has frame: {hasattr(self, '_last_frame')}")
+            
         if self.current_weight > 0.05 and not self.manual_mode:  # Only run inference if not in manual mode
             if hasattr(self, '_last_frame') and self._last_frame is not None:
+                if self._debug_counter % 20 == 0:
+                    print("[DEBUG] Triggering inference...")
                 self.inference_thread.process_frame(self._last_frame)
                 
     def confirm_transaction(self):
@@ -919,7 +1031,7 @@ class AIScalePOS(QMainWindow):
                     padding: 10px;
                 }
             """)
-            btn.clicked.connect(lambda checked, k=key: self.select_product(k, dialog))
+            btn.clicked.connect(lambda _, k=key: self.select_product(k, dialog))
             layout.addWidget(btn, row, col)
             
             col += 1
